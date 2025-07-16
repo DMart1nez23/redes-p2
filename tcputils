@@ -1,0 +1,138 @@
+from tcputils import *
+import time
+
+# ==========================================
+# Classe da conexão TCP (servidor)
+# ==========================================
+
+class MJConexao:
+    def __init__(self, sock, addr, seq_inicial=0, ack_inicial=0, callback=None, network=None):
+        self.moonwalkerSock = sock
+        self.billieJeanAddr = addr
+        self.rockWithYouCallback = callback
+        self.networkLayer = network
+
+        self.thrillerSeqNum = seq_inicial
+        self.abcAckNum = ack_inicial
+
+        self.dangerousExpected = self.abcAckNum
+        self.badWindow = 1
+        self.dontStopUntilTimeout = 1
+        self.bufferedSegments = {}
+        self.queuedData = []
+        self.smoothCriminalRTT = None
+        self.estimatedRTT = None
+        self.devRTT = None
+        self.beatItTimer = None
+        self.sentTime = {}
+        self.awaitingAck = {}
+        self.nextSeq = self.thrillerSeqNum
+
+        self.closingConnection = False
+        self.connectionClosed = False
+
+    def _send_segment(self, flags=0, payload=b''):
+        segment = make_header(self.thrillerSeqNum, self.dangerousExpected, flags) + payload
+        self.networkLayer.send(self.moonwalkerSock, segment)
+        if payload:
+            self.awaitingAck[self.thrillerSeqNum] = payload
+            self.sentTime[self.thrillerSeqNum] = time.time()
+        if flags & FLAG_FIN:
+            self.awaitingAck[self.thrillerSeqNum] = b''
+            self.sentTime[self.thrillerSeqNum] = time.time()
+
+    def _start_beatIt_timer(self):
+        if self.beatItTimer:
+            self.beatItTimer.cancel()
+
+        self.beatItTimer = self.networkLayer.start_timer(self._timeout_handler, self.dontStopUntilTimeout)
+
+    def _timeout_handler(self):
+        self.badWindow = max(1, self.badWindow // 2)
+        for seq, data in self.awaitingAck.items():
+            segment = make_header(seq, self.dangerousExpected, FLAG_ACK) + data
+            self.networkLayer.send(self.moonwalkerSock, segment)
+            self.sentTime[seq] = time.time()
+
+        self._start_beatIt_timer()
+
+    def _update_rtt(self, ack_num):
+        if ack_num in self.sentTime:
+            sample_rtt = time.time() - self.sentTime[ack_num]
+            if self.estimatedRTT is None:
+                self.estimatedRTT = sample_rtt
+                self.devRTT = sample_rtt / 2
+            else:
+                alpha = 0.125
+                beta = 0.25
+                self.estimatedRTT = (1 - alpha) * self.estimatedRTT + alpha * sample_rtt
+                self.devRTT = (1 - beta) * self.devRTT + beta * abs(sample_rtt - self.estimatedRTT)
+
+            self.dontStopUntilTimeout = self.estimatedRTT + 4 * self.devRTT
+
+    def enviar(self, dados):
+        if self.connectionClosed:
+            return
+
+        for byte in dados:
+            self.queuedData.append(byte)
+
+        while self.nextSeq < self.thrillerSeqNum + self.badWindow and self.queuedData:
+            payload = bytes([self.queuedData.pop(0)])
+            self._send_segment(flags=FLAG_ACK, payload=payload)
+            self.nextSeq += len(payload)
+            self._start_beatIt_timer()
+
+    def fechar(self):
+        self.closingConnection = True
+        self._send_segment(flags=FLAG_FIN | FLAG_ACK)
+        self._start_beatIt_timer()
+
+    def _handle_ack(self, ack_num):
+        to_remove = [seq for seq in self.awaitingAck if seq < ack_num]
+        for seq in to_remove:
+            self._update_rtt(seq)
+            self.awaitingAck.pop(seq, None)
+            self.sentTime.pop(seq, None)
+
+        if len(to_remove) > 0:
+            self.badWindow += 1
+            if not self.awaitingAck and self.beatItTimer:
+                self.beatItTimer.cancel()
+                self.beatItTimer = None
+
+        if self.closingConnection and not self.awaitingAck:
+            self.connectionClosed = True
+
+    def _handle_payload(self, seq_num, payload):
+        if seq_num == self.dangerousExpected:
+            self.dangerousExpected += len(payload)
+            self.rockWithYouCallback(self, payload)
+            self._send_segment(flags=FLAG_ACK)
+        else:
+            self._send_segment(flags=FLAG_ACK)
+
+    def _handle_fin(self, seq_num):
+        self.dangerousExpected = seq_num + 1
+        self._send_segment(flags=FLAG_ACK)
+        self.rockWithYouCallback(self, b'')
+
+    def _rdt_rcv(self, segmento):
+        seq_num, ack_num, flags, payload = read_header(segmento)
+
+        if flags & FLAG_SYN:
+            self.abcAckNum = seq_num + 1
+            self.dangerousExpected = self.abcAckNum
+            self._send_segment(flags=FLAG_SYN | FLAG_ACK)
+            return
+
+        if flags & FLAG_ACK:
+            self._handle_ack(ack_num)
+
+        if flags & FLAG_FIN:
+            self._handle_fin(seq_num)
+            return
+
+        if payload:
+            if seq_num == self.dangerousExpected:
+                self._handle_payload(seq_num, payload)
